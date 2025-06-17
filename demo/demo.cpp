@@ -36,13 +36,21 @@
 #include <gl/glu.h>
 #include "TinyWindow.h"
 
+#define VE_FONTCACHE_FREETYPE_RASTERISATION
+#ifdef VE_FONTCACHE_FREETYPE_RASTERISATION
+	#include <ft2build.h>
+	#include FT_FREETYPE_H
+    #include FT_GLYPH_H
+#endif // VE_FONTCACHE_FREETYPE_RASTERISATION
+
+#define DEMO_HARFBUZZ
 #ifdef DEMO_HARFBUZZ
 	#define VE_FONTCACHE_HARFBUZZ
-	#include <hb/hb.h>
+    #include <hb.h>
 #endif // DEMO_HARFBUZZ
 
 #define VE_FONTCACHE_IMPL
-//#define VE_FONTCACHE_DEBUGPRINT
+// #define VE_FONTCACHE_DEBUGPRINT
 #include "../ve_fontcache.h"
 
 static ve_fontcache cache;
@@ -54,6 +62,7 @@ static GLint fontcache_shader_blit_atlas;
 static GLint fontcache_shader_draw_text;
 static GLuint fontcache_fbo[ 2 ]; 
 static GLuint fontcache_fbo_texture[ 2 ];
+static std::vector< GLuint > fonecache_CPU_atlas_textures; // Used with VE_FONTCACHE_FREETYPE_RASTERISATION
 TinyWindow::vec2_t< unsigned int > window_size;
 static int mouse_scroll = 0;
 
@@ -200,6 +209,40 @@ void setup_fbo()
 	glBindFramebuffer( GL_FRAMEBUFFER, 0 );
 }
 
+// We need to flip the image here vertically for OpenGL.
+// ve_fontcache is backend agnostic, so does not flip by default, nor flips image for you.
+//
+void fontcache_flip_drawcall_image( ve_fontcache_drawlist* drawlist, ve_fontcache_draw& dcall )
+{
+#ifdef VE_FONTCACHE_FREETYPE_RASTERISATION
+    STBTT_assert( dcall.pass == VE_FONTCACHE_FRAMEBUFFER_PASS_ATLAS_UPLOAD );
+    static std::vector< uint8_t > temp_texels;
+    auto texels = &drawlist->texels[dcall.texel_offset];
+    
+    // Ensure temp buffer is large enough
+    size_t total_size = dcall.upload_region_w * dcall.upload_region_h;
+    if ( temp_texels.size() < total_size ) {
+        temp_texels.resize( total_size );
+    }
+
+    // Flip the image vertically by copying rows in reverse order
+    for ( uint32_t y = 0; y < dcall.upload_region_h; y++ ) {
+        uint32_t src_row = y;
+        uint32_t dst_row = dcall.upload_region_h - 1 - y;
+
+        // Copy the entire row
+        for ( uint32_t x = 0; x < dcall.upload_region_w; x++ ) {
+            temp_texels[dst_row * dcall.upload_region_w + x] = texels[src_row * dcall.upload_region_w + x];
+        }
+    }
+
+    // Copy the flipped data back to the original location
+    for ( size_t i = 0; i < total_size; i++ ) {
+        texels[i] = temp_texels[i];
+    }
+#endif // VE_FONTCACHE_FREETYPE_RASTERISATION
+}
+
 void fontcache_drawcmd()
 {
 	ve_fontcache_optimise_drawlist( &cache );
@@ -212,7 +255,7 @@ void fontcache_drawcmd()
 	}
 
 	GLuint vbo = 0, ibo = 0;
-	compile_vbo( vbo, ibo, drawlist->vertices.data(), drawlist->vertices.size(), drawlist->indices.data(), drawlist->indices.size() );
+	compile_vbo( vbo, ibo, drawlist->vertices.data(), ( int ) drawlist->vertices.size(), drawlist->indices.data(), ( int ) drawlist->indices.size() );
 	glEnableVertexAttribArray( 0 ); glEnableVertexAttribArray( 1 );
 	glVertexAttribPointer( 0, 2, GL_FLOAT, false, sizeof( ve_fontcache_vertex ), 0 );
 	glVertexAttribPointer( 1, 2, GL_FLOAT, false, sizeof( ve_fontcache_vertex ), ( GLvoid* )( 2 * sizeof( float ) ) );
@@ -240,19 +283,50 @@ void fontcache_drawcmd()
 			glActiveTexture( GL_TEXTURE0 );
 			glBindTexture( GL_TEXTURE_2D, fontcache_fbo_texture[0] );
 			glDisable( GL_FRAMEBUFFER_SRGB );
-		} else {
+		} else if ( dcall.pass == VE_FONTCACHE_FRAMEBUFFER_PASS_TARGET || dcall.pass == VE_FONTCACHE_FRAMEBUFFER_PASS_TARGET_UNCACHED || dcall.pass == VE_FONTCACHE_FRAMEBUFFER_PASS_TARGET_CPU_CACHED ) {
 			glUseProgram( fontcache_shader_draw_text );
 			glBindFramebuffer( GL_FRAMEBUFFER, 0 );
 			glBlendFunc( GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA );
 			glViewport( 0, 0, window_size.width, window_size.height );
 			glScissor( 0, 0, window_size.width, window_size.height );
-			glUniform1i( glGetUniformLocation( fontcache_shader_draw_text, "src_texture" ), 0 );
-			glUniform1ui( glGetUniformLocation( fontcache_shader_draw_text, "downsample" ), dcall.pass == VE_FONTCACHE_FRAMEBUFFER_PASS_TARGET_UNCACHED ? 1 : 0 );
+            glUniform1i( glGetUniformLocation( fontcache_shader_draw_text, "src_texture" ), 0 );
+            if ( dcall.pass == VE_FONTCACHE_FRAMEBUFFER_PASS_TARGET_CPU_CACHED  ) {
+            #ifdef VE_FONTCACHE_FREETYPE_RASTERISATION
+                glUniform1ui( glGetUniformLocation( fontcache_shader_draw_text, "downsample" ), 0 );
+                glActiveTexture( GL_TEXTURE0 );
+                glBindTexture( GL_TEXTURE_2D, fonecache_CPU_atlas_textures[dcall.atlas_page] );
+            #endif // VE_VE_FONTCACHE_FREETYPE_RASTERISATION
+            } else {
+			    glUniform1ui( glGetUniformLocation( fontcache_shader_draw_text, "downsample" ), dcall.pass == VE_FONTCACHE_FRAMEBUFFER_PASS_TARGET_UNCACHED ? 1 : 0 );
+                glActiveTexture( GL_TEXTURE0 );
+                glBindTexture( GL_TEXTURE_2D, dcall.pass == VE_FONTCACHE_FRAMEBUFFER_PASS_TARGET_UNCACHED ? fontcache_fbo_texture[0] : fontcache_fbo_texture[1] );
+            }
 			glUniform4fv( glGetUniformLocation( fontcache_shader_draw_text, "colour" ), 1, dcall.colour );
-			glActiveTexture( GL_TEXTURE0 );
-			glBindTexture( GL_TEXTURE_2D, dcall.pass == VE_FONTCACHE_FRAMEBUFFER_PASS_TARGET_UNCACHED ? fontcache_fbo_texture[0] : fontcache_fbo_texture[1] );
 			glEnable( GL_FRAMEBUFFER_SRGB );
-		}
+        #ifdef VE_FONTCACHE_FREETYPE_RASTERISATION
+        } else if ( dcall.pass == VE_FONTCACHE_FRAMEBUFFER_PASS_ATLAS_PAGE_TEXTURE_CREATE ) {
+            fonecache_CPU_atlas_textures.resize( std::max( ( int ) fonecache_CPU_atlas_textures.size(), ( int ) dcall.atlas_page + 1 ) );
+            glGenTextures( 1, &fonecache_CPU_atlas_textures[dcall.atlas_page] );
+            glActiveTexture( GL_TEXTURE0 );
+            glBindTexture( GL_TEXTURE_2D, fonecache_CPU_atlas_textures[dcall.atlas_page] );
+            glPixelStorei( GL_UNPACK_ALIGNMENT, 1 );
+            glPixelStorei( GL_PACK_ALIGNMENT, 1 );
+            glTexImage2D( GL_TEXTURE_2D, 0, GL_R8, VE_FONTCACHE_CPU_ATLAS_PAGE_SIZE, VE_FONTCACHE_CPU_ATLAS_PAGE_SIZE, 0, GL_RED, GL_UNSIGNED_BYTE, nullptr );
+            glTexParameteri( GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE );
+            glTexParameteri( GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE );
+            glTexParameteri( GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST );
+            glTexParameteri( GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST );
+        } else if ( dcall.pass == VE_FONTCACHE_FRAMEBUFFER_PASS_ATLAS_UPLOAD ) {
+            STBTT_assert( fonecache_CPU_atlas_textures.size() > dcall.atlas_page );
+            glActiveTexture( GL_TEXTURE0 );
+            glBindTexture( GL_TEXTURE_2D, fonecache_CPU_atlas_textures[dcall.atlas_page] );
+            glPixelStorei( GL_UNPACK_ALIGNMENT, 1 );
+            glPixelStorei( GL_PACK_ALIGNMENT, 1 );
+            fontcache_flip_drawcall_image( drawlist, dcall ); // Safe to directly modify drawlist as needed.
+            glTexSubImage2D( GL_TEXTURE_2D, 0, dcall.upload_region_x, dcall.upload_region_y,
+                    dcall.upload_region_w, dcall.upload_region_h, GL_RED, GL_UNSIGNED_BYTE, &drawlist->texels[dcall.texel_offset]);
+        #endif // VE_VE_FONTCACHE_FREETYPE_RASTERISATION
+        }
 		if ( dcall.clear_before_draw ) {
 			glClearColor( 0.0f, 0.0f, 0.0f, 0.0f );
 			glClear( GL_COLOR_BUFFER_BIT );
@@ -380,7 +454,7 @@ void render_demo( TinyWindow::tWindow* window, float dT )
 	static float current_scroll = 0.1f;
 
 	if ( current_scroll < 1.5f ) {
-		std::string intro = 
+		std::u8string intro = 
 			u8"Ça va! Everything here is rendered using VE Font Cache, a single header-only library designed for game engines.\n"
 			u8"It aims to:\n"
 			u8"           •    Be fast and simple to integrate.\n"
@@ -402,7 +476,7 @@ void render_demo( TinyWindow::tWindow* window, float dT )
 	float section_start = 0.42f; float section_end = 2.32f;
 	if ( current_scroll > section_start && current_scroll < section_end )
 	{
-		std::string how_it_works = 
+		std::u8string how_it_works = 
 			u8"Glyphs are GPU rasterised with 16x supersampling. This method is a simplification of \"Easy Scalable Text Rendering on the GPU\",\n"
 			u8"by Evan Wallace, making use of XOR blending. Bézier curves are handled via brute force triangle tessellation; even 6 triangles per\n"
 			u8"curve only generates < 300 triangles, which is nothing for modern GPUs! This avoids complex frag shader for reasonable quality.\n"
@@ -411,7 +485,7 @@ void render_demo( TinyWindow::tWindow* window, float dT )
 			u8"straight up LRU ( Least Recently Used ) caching scheme to be employed.\n"
 			u8"The hb_font atlas is a single 4k x 2k R8 texture divided into 4 regions:"
 			;
-		std::string caching_strategy = 
+		std::u8string caching_strategy = 
 			u8"                         2k\n"
 			u8"                         --------------------\n"
 			u8"                         |         |        |\n"
@@ -436,7 +510,7 @@ void render_demo( TinyWindow::tWindow* window, float dT )
 			u8"                         Region C = 64x64 caches, 512 glyphs\n"
 			u8"                         Region D = 128x128 caches, 256 glyphs\n"
 			;
-		std::string how_it_works2 = 
+		std::u8string how_it_works2 = 
 			u8"Region A is designed for small glyphs, Region B is for tall glyphs, Region C is for large glyphs, and Region D for huge glyphs.\n"
 			u8"Glyphs are first rendered to an intermediate 2k x 512px R8 texture. This allows for minimum 4 Region D glyphs supersampled at\n"
 			u8"4 x 4 = 16x supersampling, and 8 Region C glyphs similarly. A simple 16-tap box downsample shader is then used to blit from this\n"
@@ -451,7 +525,7 @@ void render_demo( TinyWindow::tWindow* window, float dT )
 	section_start = 1.2f; section_end = 3.2f;
 	if ( current_scroll > section_start && current_scroll < section_end )
 	{
-		std::string font_family_test =
+		std::u8string font_family_test =
 			u8"Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor\n"
 			u8"incididunt ut labore et dolore magna aliqua. Est ullamcorper eget nulla facilisi\n"
 			u8"etiam dignissim diam quis enim. Convallis convallis tellus id interdum.";
@@ -498,7 +572,7 @@ void render_demo( TinyWindow::tWindow* window, float dT )
 		static int raindropsX[ NUM_RAINDROPS ];
 		static int raindropsY[ NUM_RAINDROPS ];
 		static float code_colour[4];
-		static std::array< std::string, 72 > codes = {
+		static std::array< std::u8string, 72 > codes = {
 			u8" ", u8"0", u8"1", u8"2", u8"3", u8"4", u8"5", u8"6", u8"7", u8"8", u8"9", u8"Z", u8"T", u8"H", u8"E", u8"｜", u8"¦", u8"日",
 			u8"ﾊ", u8"ﾐ", u8"ﾋ", u8"ｰ", u8"ｳ", u8"ｼ", u8"ﾅ", u8"ﾓ", u8"ﾆ", u8"ｻ", u8"ﾜ", u8"ﾂ", u8"ｵ", u8"ﾘ", u8"ｱ", u8"ﾎ", u8"ﾃ", u8"ﾏ",
 			u8"ｹ", u8"ﾒ", u8"ｴ", u8"ｶ", u8"ｷ", u8"ﾑ", u8"ﾕ", u8"ﾗ", u8"ｾ", u8"ﾈ", u8"ｽ", u8"ﾂ", u8"ﾀ", u8"ﾇ", u8"ﾍ", u8":", u8"・", u8".",
@@ -534,7 +608,7 @@ void render_demo( TinyWindow::tWindow* window, float dT )
 		}
 
 		// Draw grid.
-		ve_fontcache_draw_text( &cache, title_font, u8"Raincode demo", 0.2f, current_scroll - ( section_start + 0.2f ), 1.0f / window_size.width,  1.0f / window_size.height );
+		ve_fontcache_draw_text( &cache, title_font, u8"Raincode demo", 0.2f, current_scroll - ( section_start + 0.2f ), 1.0f / window_size.width,  1.0f / window_size.height, false );
 		for ( int y = 0; y < GRID_H; y++ ) {
 			for ( int x = 0; x < GRID_W; x++ ) {
 				float posx = 0.2f + x * 0.007f, posy = current_scroll - ( section_start + 0.24f + y * 0.018f );
@@ -546,7 +620,7 @@ void render_demo( TinyWindow::tWindow* window, float dT )
 					if ( code_colour[3] < 0.0f ) continue;
 				}
 				ve_fontcache_set_colour( &cache, code_colour );
-				ve_fontcache_draw_text( &cache, demo_raincode_font, codes[ grid[ y * GRID_W + x ] ], posx, posy, 1.0f / window_size.width,  1.0f / window_size.height );
+				ve_fontcache_draw_text( &cache, demo_raincode_font, codes[ grid[ y * GRID_W + x ] ], posx, posy, 1.0f / window_size.width,  1.0f / window_size.height, false );
 			}
 		}
 		
@@ -554,7 +628,7 @@ void render_demo( TinyWindow::tWindow* window, float dT )
 		ve_fontcache_set_colour( &cache, code_colour );
 	}
 
-	section_start = 3.3f; section_end = 5.1;
+	section_start = 3.3f; section_end = 5.1f;
 	if ( current_scroll > section_start && current_scroll < section_end )
 	{
 		const int GRID_W = 30, GRID_H = 15, GRID2_W = 8, GRID2_H = 2, GRID3_W = 16, GRID3_H = 4;
@@ -603,13 +677,13 @@ void render_demo( TinyWindow::tWindow* window, float dT )
 		};
 
 		// Draw grid.
-		ve_fontcache_draw_text( &cache, title_font, u8"Cache pressure test", 0.2f, current_scroll - ( section_start + 0.2f ), 1.0f / window_size.width,  1.0f / window_size.height );
+		ve_fontcache_draw_text( &cache, title_font, u8"Cache pressure test", 0.2f, current_scroll - ( section_start + 0.2f ), 1.0f / window_size.width,  1.0f / window_size.height, false );
 		for ( int y = 0; y < GRID_H; y++ ) {
 			for ( int x = 0; x < GRID_W; x++ ) {
 				float posx = 0.2f + x * 0.02f, posy = current_scroll - ( section_start + 0.24f + y * 0.025f );
 				char c[5] = {'\0', '\0', '\0', '\0', '\0'};
 				codepoint_to_utf8( c, grid[ y * GRID_W + x ] );
-				ve_fontcache_draw_text( &cache, demo_chinese_font, c, posx, posy, 1.0f / window_size.width,  1.0f / window_size.height );
+				ve_fontcache_draw_text( &cache, demo_chinese_font, (const char8_t*) c, posx, posy, 1.0f / window_size.width,  1.0f / window_size.height, false );
 			}
 		}
 		for ( int y = 0; y < GRID2_H; y++ ) {
@@ -617,7 +691,7 @@ void render_demo( TinyWindow::tWindow* window, float dT )
 				float posx = 0.2f + x * 0.03f, posy = current_scroll - ( section_start + 0.66f + y * 0.052f );
 				char c[5] = {'\0', '\0', '\0', '\0', '\0'};
 				codepoint_to_utf8( c, grid2[ y * GRID2_W + x ] );
-				ve_fontcache_draw_text( &cache, demo_grid2_font, c, posx, posy, 1.0f / window_size.width,  1.0f / window_size.height );
+				ve_fontcache_draw_text( &cache, demo_grid2_font, (const char8_t*) c, posx, posy, 1.0f / window_size.width,  1.0f / window_size.height, false );
 			}
 		}
 		for ( int y = 0; y < GRID3_H; y++ ) {
@@ -625,7 +699,7 @@ void render_demo( TinyWindow::tWindow* window, float dT )
 				float posx = 0.45f + x * 0.02f, posy = current_scroll - ( section_start + 0.64f + y * 0.034f );
 				char c[5] = {'\0', '\0', '\0', '\0', '\0'};
 				codepoint_to_utf8( c, grid3[ y * GRID3_W + x ] );
-				ve_fontcache_draw_text( &cache, demo_grid3_font, c, posx, posy, 1.0f / window_size.width,  1.0f / window_size.height );
+				ve_fontcache_draw_text( &cache, demo_grid3_font, (const char8_t*) c, posx, posy, 1.0f / window_size.width,  1.0f / window_size.height, false );
 			}
 		}
 	}
@@ -635,7 +709,7 @@ void render_demo( TinyWindow::tWindow* window, float dT )
 	static float mouse_down_pos = -1.0f, mouse_down_scroll = -1.0f, mouse_prev_pos, scroll_velocity = 0.0f;
 	if ( window->mouseButton[ ( int ) TinyWindow::mouseButton_t::left ] == TinyWindow::buttonState_t::down ) {
 		if ( mouse_down_pos < 0.0f ) {
-			mouse_down_pos = mouse_prev_pos = window->mousePosition.y;
+			mouse_down_pos = mouse_prev_pos = ( float ) window->mousePosition.y;
 			mouse_down_scroll = current_scroll;
 		}
 		demo_autoscroll = false;
@@ -643,7 +717,7 @@ void render_demo( TinyWindow::tWindow* window, float dT )
 
 		float new_scroll_velocity = ( mouse_prev_pos - window->mousePosition.y ) / window_size.height;
 		scroll_velocity = scroll_velocity * 0.2f + new_scroll_velocity * 0.8f;
-		mouse_prev_pos = window->mousePosition.y;
+		mouse_prev_pos = ( float ) window->mousePosition.y;
 	} else {
 		scroll_velocity += mouse_scroll * 0.05f;
 		mouse_down_pos = -1.0f;
